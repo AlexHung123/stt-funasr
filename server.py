@@ -6,11 +6,15 @@ Defaults are tuned for this Mac (Apple Silicon): SenseVoice on MPS when availabl
 otherwise CPU. Wraps FunASR's built-in FastAPI app and patches VAD / generate
 kwargs for long-form audio/video (e.g. ~1 hour).
 
+Video containers (mp4/mkv/webm/mov) are converted in-process with ffmpeg to
+16 kHz mono PCM WAV before ASR. Common audio (wav/mp3/...) keeps FunASR's
+original path. No HTTP loopback — conversion then calls the in-app handler.
+
 Endpoints:
   GET  /health
   GET  /v1/models
-  POST /v1/audio/transcriptions   (OpenAI-compatible)
-  POST /asr                       (FunASR REST)
+  POST /v1/audio/transcriptions   (OpenAI-compatible; video + audio)
+  POST /asr                       (FunASR REST; video + audio)
   GET  /docs                      (Swagger UI)
 
 Examples:
@@ -18,13 +22,23 @@ Examples:
   python server.py --device cpu --port 8000
   python server.py --model sensevoice --device mps
   python server.py --vad-max-single-segment-time 60000 --batch-size-s 60
+
+  curl -X POST http://127.0.0.1:8002/v1/audio/transcriptions \\
+    -F file=@clip.mp4 -F model=sensevoice -F response_format=verbose_json \\
+    -o result.json
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
+import subprocess
 import sys
-from typing import Any, Callable
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 
 def detect_device() -> str:
@@ -39,6 +53,260 @@ def detect_device() -> str:
     except Exception:
         pass
     return "cpu"
+
+
+# Video containers that need an ffmpeg extract step before STT.
+VIDEO_EXTENSIONS = frozenset({".mp4", ".mkv", ".webm", ".mov"})
+
+
+def _file_suffix(filename: Optional[str]) -> str:
+    if not filename:
+        return ""
+    return Path(filename).suffix.lower()
+
+
+def _require_ffmpeg() -> str:
+    path = shutil.which("ffmpeg")
+    if not path:
+        raise RuntimeError(
+            "ffmpeg not found on PATH. Install it to transcribe video "
+            "(e.g. brew install ffmpeg)."
+        )
+    return path
+
+
+def ffmpeg_extract_wav(src_path: str, dst_wav_path: str) -> None:
+    """
+    Extract audio to 16 kHz mono PCM WAV for ASR.
+
+      ffmpeg -y -i input -ar 16000 -ac 1 -c:a pcm_s16le /tmp/meeting.wav
+    """
+    ffmpeg = _require_ffmpeg()
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        src_path,
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        dst_wav_path,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            timeout=3600,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("ffmpeg timed out while extracting audio from video") from exc
+    except subprocess.CalledProcessError as exc:
+        err = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        tail = err[-800:] if err else str(exc)
+        raise RuntimeError(f"ffmpeg failed to extract audio: {tail}") from exc
+    if not os.path.isfile(dst_wav_path) or os.path.getsize(dst_wav_path) == 0:
+        raise RuntimeError("ffmpeg produced an empty or missing WAV file")
+    # Keep stderr available for debugging on quiet success paths if needed.
+    _ = proc
+
+
+def _unlink_quiet(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+@dataclass
+class PreparedMedia:
+    """Upload handed to FunASR after optional video→wav conversion."""
+
+    upload: Any
+    cleanup_paths: list[str] = field(default_factory=list)
+    _open_handles: list[Any] = field(default_factory=list)
+
+    def cleanup(self) -> None:
+        for handle in self._open_handles:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        self._open_handles.clear()
+        for path in self.cleanup_paths:
+            _unlink_quiet(path)
+        self.cleanup_paths.clear()
+
+
+class _AsyncFileUpload:
+    """Minimal UploadFile-compatible object for FunASR handlers (async read + filename)."""
+
+    def __init__(self, filename: str, fileobj: Any):
+        self.filename = filename
+        self.file = fileobj
+
+    async def read(self, size: int = -1) -> bytes:
+        return self.file.read(size)
+
+    async def seek(self, offset: int) -> None:
+        self.file.seek(offset)
+
+    async def close(self) -> None:
+        self.file.close()
+
+
+async def prepare_media_for_asr(file: Any) -> PreparedMedia:
+    """
+    1) Receive upload → temp input (video only)
+    2) mp4/mkv/webm/mov → ffmpeg 16k mono wav; else keep original bytes/path logic
+    3) Caller runs in-process FunASR handler
+    4) Caller must .cleanup() temp files
+    """
+    filename = getattr(file, "filename", None) or "audio.bin"
+    suffix = _file_suffix(filename)
+
+    # Non-video (wav/mp3/flac/...): original FunASR path — do not re-encode.
+    if suffix not in VIDEO_EXTENSIONS:
+        if hasattr(file, "seek"):
+            await file.seek(0)
+        return PreparedMedia(upload=file)
+
+    content = await file.read()
+    if not content:
+        raise ValueError("Empty upload")
+
+    cleanup: list[str] = []
+    fd_in, path_in = tempfile.mkstemp(prefix="stt_in_", suffix=suffix)
+    os.close(fd_in)
+    cleanup.append(path_in)
+    try:
+        with open(path_in, "wb") as f:
+            f.write(content)
+
+        fd_out, path_wav = tempfile.mkstemp(prefix="stt_wav_", suffix=".wav")
+        os.close(fd_out)
+        cleanup.append(path_wav)
+
+        print(f"  video-input: ffmpeg extract {suffix} → 16k mono wav ({filename})")
+        ffmpeg_extract_wav(path_in, path_wav)
+
+        # FunASR handlers re-read the upload; feed a fresh WAV-compatible object.
+        wav_file = open(path_wav, "rb")
+        upload = _AsyncFileUpload(filename="meeting.wav", fileobj=wav_file)
+        return PreparedMedia(
+            upload=upload,
+            cleanup_paths=cleanup,
+            _open_handles=[wav_file],
+        )
+    except Exception:
+        for path in cleanup:
+            _unlink_quiet(path)
+        raise
+
+
+def _remove_post_routes(app: Any, paths: set[str]) -> dict[str, Callable]:
+    """Drop POST routes for the given paths; return path → original endpoint."""
+    found: dict[str, Callable] = {}
+    keep = []
+    for route in app.router.routes:
+        path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None) or set()
+        if path in paths and "POST" in methods:
+            found[path] = route.endpoint
+        else:
+            keep.append(route)
+    app.router.routes[:] = keep
+    return found
+
+
+def install_video_input_support(app: Any) -> None:
+    """
+    Wrap FunASR transcription routes so video is converted in-process before ASR.
+
+    Flow: file → temp → (optional ffmpeg) → original handler → cleanup → JSON.
+    Audio formats (mp3/wav/...) call the original handler unchanged.
+    """
+    from fastapi import File, Form, HTTPException, UploadFile
+    from typing import Optional as Opt
+
+    originals = _remove_post_routes(
+        app, {"/v1/audio/transcriptions", "/asr"}
+    )
+    if not originals:
+        print("  video-input: warning — no transcription routes found to wrap")
+        return
+
+    original_transcribe = originals.get("/v1/audio/transcriptions")
+    original_asr = originals.get("/asr")
+
+    if original_transcribe is not None:
+
+        @app.post("/v1/audio/transcriptions")
+        async def transcribe_with_video(  # type: ignore[no-redef]
+            file: UploadFile = File(...),
+            model: str = Form(default="sensevoice"),
+            language: Opt[str] = Form(default=None),
+            response_format: Opt[str] = Form(default="json"),
+            spk: bool = Form(default=False),
+        ):
+            try:
+                prepared = await prepare_media_for_asr(file)
+            except HTTPException:
+                raise
+            except (RuntimeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500, detail=f"media prepare failed: {exc}"
+                ) from exc
+            try:
+                return await original_transcribe(
+                    file=prepared.upload,
+                    model=model,
+                    language=language,
+                    response_format=response_format,
+                    spk=spk,
+                )
+            finally:
+                prepared.cleanup()
+
+        print("  video-input: wrapped POST /v1/audio/transcriptions")
+
+    if original_asr is not None:
+
+        @app.post("/asr")
+        async def asr_with_video(  # type: ignore[no-redef]
+            file: UploadFile = File(...),
+            language: Opt[str] = Form(default=None),
+            hotwords: str = Form(default=""),
+            spk: bool = Form(default=False),
+        ):
+            try:
+                prepared = await prepare_media_for_asr(file)
+            except HTTPException:
+                raise
+            except (RuntimeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500, detail=f"media prepare failed: {exc}"
+                ) from exc
+            try:
+                return await original_asr(
+                    file=prepared.upload,
+                    language=language,
+                    hotwords=hotwords,
+                    spk=spk,
+                )
+            finally:
+                prepared.cleanup()
+
+        print("  video-input: wrapped POST /asr")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,7 +326,15 @@ Test with curl:
   curl -X POST http://127.0.0.1:8002/v1/audio/transcriptions \\
     -F file=@long.wav \\
     -F model=sensevoice \\
-    -F response_format=verbose_json
+    -F response_format=verbose_json \\
+    -o result.json
+
+  # Video (mp4/mkv/webm/mov) — server extracts 16k mono wav via ffmpeg:
+  curl -X POST http://127.0.0.1:8002/v1/audio/transcriptions \\
+    -F file=@clip.mp4 \\
+    -F model=sensevoice \\
+    -F response_format=verbose_json \\
+    -o result.json
 """,
     )
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
@@ -270,6 +546,12 @@ def main() -> None:
         batch_size_s=args.batch_size_s,
     )
 
+    print("Installing video input support (ffmpeg → 16k mono wav)...")
+    install_video_input_support(app)
+    ffmpeg_ok = shutil.which("ffmpeg") is not None
+    if not ffmpeg_ok:
+        print("  video-input: WARNING — ffmpeg not on PATH; video uploads will fail")
+
     print("╔══════════════════════════════════════════════╗")
     print(f"║  {server_version_label():<44}║")
     print(f"║  Device: {args.device:<35}║")
@@ -282,10 +564,14 @@ def main() -> None:
     merge_label = f"on/{args.merge_length_s}s" if args.merge_vad else "off"
     print(f"║  merge_vad: {merge_label:<32}║")
     print(f"║  batch_size_s: {args.batch_size_s:<29}║")
+    video_label = "on (need ffmpeg)" if ffmpeg_ok else "on (ffmpeg MISSING)"
+    print(f"║  video mp4/mkv/webm/mov: {video_label:<19}║")
     print(f"║  URL:    http://{args.host}:{args.port}/v1{' ' * max(0, 20 - len(str(args.port)))}║")
     print(f"║  Docs:   http://{args.host}:{args.port}/docs{' ' * max(0, 18 - len(str(args.port)))}║")
     print("╚══════════════════════════════════════════════╝")
     print("Long audio: VAD splits speech into chunks; full file length is OK (~1h+).")
+    print("Video: mp4/mkv/webm/mov → ffmpeg 16k mono wav in-process, then SenseVoice.")
+    print("Audio: wav/mp3/... uses FunASR stock path (no re-encode).")
     print("First request may download SenseVoice weights from ModelScope.")
 
     uvicorn.run(app, host=args.host, port=args.port, timeout_keep_alive=600)
