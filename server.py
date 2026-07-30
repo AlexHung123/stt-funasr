@@ -31,6 +31,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import shutil
 import subprocess
@@ -45,6 +46,10 @@ from typing import Any, Callable, Optional
 # local namespace of install_video_input_support(). Local-only imports leave
 # UploadFile undefined and crash Pydantic with "not fully defined".
 from fastapi import File, Form, HTTPException, UploadFile
+
+# FunASR AutoModel (SenseVoice) is not concurrency-safe: shared kwargs / VAD state
+# and temp-file lifecycles race under concurrent requests. Serialize prepare + ASR.
+_asr_lock = asyncio.Lock()
 
 
 def detect_device() -> str:
@@ -234,8 +239,12 @@ def install_video_input_support(app: Any) -> None:
     """
     Wrap FunASR transcription routes so video is converted in-process before ASR.
 
-    Flow: file → temp → (optional ffmpeg) → original handler → cleanup → JSON.
-    Audio formats (mp3/wav/...) call the original handler unchanged.
+    Flow (serialized under ``_asr_lock``):
+      file → temp → (optional ffmpeg) → original handler → cleanup → JSON.
+
+    Concurrent requests queue on the lock (FIFO within one process). Audio
+    formats (mp3/wav/...) still call the original handler, but under the same
+    lock so SenseVoice is never shared across in-flight jobs.
     """
     originals = _remove_post_routes(
         app, {"/v1/audio/transcriptions", "/asr"}
@@ -257,28 +266,30 @@ def install_video_input_support(app: Any) -> None:
             response_format: Optional[str] = Form(default="json"),
             spk: bool = Form(default=False),
         ):
-            try:
-                prepared = await prepare_media_for_asr(file)
-            except HTTPException:
-                raise
-            except (RuntimeError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=500, detail=f"media prepare failed: {exc}"
-                ) from exc
-            try:
-                return await original_transcribe(
-                    file=prepared.upload,
-                    model=model,
-                    language=language,
-                    response_format=response_format,
-                    spk=spk,
-                )
-            finally:
-                prepared.cleanup()
+            # One ASR job at a time (shared AutoModel + temp-file lifecycle).
+            async with _asr_lock:
+                try:
+                    prepared = await prepare_media_for_asr(file)
+                except HTTPException:
+                    raise
+                except (RuntimeError, ValueError) as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=500, detail=f"media prepare failed: {exc}"
+                    ) from exc
+                try:
+                    return await original_transcribe(
+                        file=prepared.upload,
+                        model=model,
+                        language=language,
+                        response_format=response_format,
+                        spk=spk,
+                    )
+                finally:
+                    prepared.cleanup()
 
-        print("  video-input: wrapped POST /v1/audio/transcriptions")
+        print("  video-input: wrapped POST /v1/audio/transcriptions (serialized)")
 
     if original_asr is not None:
 
@@ -289,27 +300,28 @@ def install_video_input_support(app: Any) -> None:
             hotwords: str = Form(default=""),
             spk: bool = Form(default=False),
         ):
-            try:
-                prepared = await prepare_media_for_asr(file)
-            except HTTPException:
-                raise
-            except (RuntimeError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=500, detail=f"media prepare failed: {exc}"
-                ) from exc
-            try:
-                return await original_asr(
-                    file=prepared.upload,
-                    language=language,
-                    hotwords=hotwords,
-                    spk=spk,
-                )
-            finally:
-                prepared.cleanup()
+            async with _asr_lock:
+                try:
+                    prepared = await prepare_media_for_asr(file)
+                except HTTPException:
+                    raise
+                except (RuntimeError, ValueError) as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=500, detail=f"media prepare failed: {exc}"
+                    ) from exc
+                try:
+                    return await original_asr(
+                        file=prepared.upload,
+                        language=language,
+                        hotwords=hotwords,
+                        spk=spk,
+                    )
+                finally:
+                    prepared.cleanup()
 
-        print("  video-input: wrapped POST /asr")
+        print("  video-input: wrapped POST /asr (serialized)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -575,6 +587,7 @@ def main() -> None:
     print("Long audio: VAD splits speech into chunks; full file length is OK (~1h+).")
     print("Video: mp4/mkv/webm/mov → ffmpeg 16k mono wav in-process, then SenseVoice.")
     print("Audio: wav/mp3/... uses FunASR stock path (no re-encode).")
+    print("Concurrency: ASR jobs are serialized (one at a time) via asyncio.Lock.")
     print("First request may download SenseVoice weights from ModelScope.")
 
     uvicorn.run(app, host=args.host, port=args.port, timeout_keep_alive=600)
