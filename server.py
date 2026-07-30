@@ -40,6 +40,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+# Must be module-level: with `from __future__ import annotations`, route param
+# annotations become ForwardRefs resolved against module globals — not the
+# local namespace of install_video_input_support(). Local-only imports leave
+# UploadFile undefined and crash Pydantic with "not fully defined".
+from fastapi import File, Form, HTTPException, UploadFile
+
 
 def detect_device() -> str:
     """Prefer MPS on Apple Silicon, then CUDA, else CPU."""
@@ -231,9 +237,6 @@ def install_video_input_support(app: Any) -> None:
     Flow: file → temp → (optional ffmpeg) → original handler → cleanup → JSON.
     Audio formats (mp3/wav/...) call the original handler unchanged.
     """
-    from fastapi import File, Form, HTTPException, UploadFile
-    from typing import Optional as Opt
-
     originals = _remove_post_routes(
         app, {"/v1/audio/transcriptions", "/asr"}
     )
@@ -250,8 +253,8 @@ def install_video_input_support(app: Any) -> None:
         async def transcribe_with_video(  # type: ignore[no-redef]
             file: UploadFile = File(...),
             model: str = Form(default="sensevoice"),
-            language: Opt[str] = Form(default=None),
-            response_format: Opt[str] = Form(default="json"),
+            language: Optional[str] = Form(default=None),
+            response_format: Optional[str] = Form(default="json"),
             spk: bool = Form(default=False),
         ):
             try:
@@ -282,7 +285,7 @@ def install_video_input_support(app: Any) -> None:
         @app.post("/asr")
         async def asr_with_video(  # type: ignore[no-redef]
             file: UploadFile = File(...),
-            language: Opt[str] = Form(default=None),
+            language: Optional[str] = Form(default=None),
             hotwords: str = Form(default=""),
             spk: bool = Form(default=False),
         ):
