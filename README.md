@@ -11,12 +11,14 @@ Local speech-to-text stack using [FunASR](https://github.com/modelscope/FunASR) 
 
 ### 1. Prerequisites
 
-| Tool | Notes |
-|------|--------|
-| Python 3.10+ | 3.13 is tested on this project |
-| `ffmpeg` | Required for video uploads (`brew install ffmpeg`) |
-| Git | To clone the repo |
-| Apple Silicon / NVIDIA / CPU | Device is auto-detected: `mps` → `cuda` → `cpu` |
+
+| Tool                         | Notes                                              |
+| ---------------------------- | -------------------------------------------------- |
+| Python 3.10+                 | 3.13 is tested on this project                     |
+| `ffmpeg`                     | Required for video uploads (`brew install ffmpeg`) |
+| Git                          | To clone the repo                                  |
+| Apple Silicon / NVIDIA / CPU | Device is auto-detected: `mps` → `cuda` → `cpu`    |
+
 
 ### 2. Clone
 
@@ -34,12 +36,14 @@ pip install -U pip
 pip install -r requirements.txt
 ```
 
-| Package | Role |
-|---------|------|
-| `funasr` | ASR toolkit + SenseVoice pipeline |
-| `torch` / `torchaudio` | Inference backend (MPS on Apple Silicon) |
-| `fastapi` + `uvicorn` + `python-multipart` | HTTP API |
-| `modelscope` | Model download (SenseVoice weights) |
+
+| Package                                    | Role                                     |
+| ------------------------------------------ | ---------------------------------------- |
+| `funasr`                                   | ASR toolkit + SenseVoice pipeline        |
+| `torch` / `torchaudio`                     | Inference backend (MPS on Apple Silicon) |
+| `fastapi` + `uvicorn` + `python-multipart` | HTTP API                                 |
+| `modelscope`                               | Model download (SenseVoice weights)      |
+
 
 ### 4. Install ffmpeg (video input)
 
@@ -61,13 +65,15 @@ python server.py
 
 Defaults:
 
-| Setting | Value |
-|---------|--------|
-| Model | `sensevoice` (`iic/SenseVoiceSmall`) |
-| Device | auto (`mps` if available, else `cuda`, else `cpu`) |
-| Port | `8002` |
-| Host | `0.0.0.0` |
+
+| Setting       | Value                                                              |
+| ------------- | ------------------------------------------------------------------ |
+| Model         | `sensevoice` (`iic/SenseVoiceSmall`)                               |
+| Device        | auto (`mps` if available, else `cuda`, else `cpu`)                 |
+| Port          | `8002`                                                             |
+| Host          | `0.0.0.0`                                                          |
 | Long-form VAD | on (`max_single_segment_time=60s`, `merge_vad`, `batch_size_s=60`) |
+
 
 The first start downloads SenseVoice (and VAD) weights from ModelScope. That can take a few minutes. Weights cache under `~/.cache/modelscope`.
 
@@ -169,13 +175,15 @@ Leave nginx’s existing `/v1/` location pointed at LM Studio. FunASR is only un
 
 Endpoints:
 
-| Method | Path | Notes |
-|--------|------|--------|
-| `GET` | `/health` | Liveness |
-| `GET` | `/v1/models` | OpenAI-compatible model list |
+
+| Method | Path                       | Notes                            |
+| ------ | -------------------------- | -------------------------------- |
+| `GET`  | `/health`                  | Liveness                         |
+| `GET`  | `/v1/models`               | OpenAI-compatible model list     |
 | `POST` | `/v1/audio/transcriptions` | OpenAI-compatible; audio + video |
-| `POST` | `/asr` | FunASR REST; audio + video |
-| `GET` | `/docs` | Swagger UI |
+| `POST` | `/asr`                     | FunASR REST; audio + video       |
+| `GET`  | `/docs`                    | Swagger UI                       |
+
 
 ### cURL (audio)
 
@@ -224,13 +232,15 @@ print(result.text)
 
 VAD splits speech into short chunks so full file length is fine. This wrapper applies SenseVoice-friendly long-form defaults:
 
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `--vad-max-single-segment-time` | `60000` (ms) | Max continuous speech before forced cut |
-| `--vad-max-end-silence-time` | `800` (ms) | Silence that ends a segment |
-| `--merge-vad` / `--no-merge-vad` | on | Merge short VAD clips before ASR |
-| `--merge-length-s` | `15` | Max length of merged clips (seconds) |
-| `--batch-size-s` | `60` | ASR batch budget in seconds of speech |
+
+| Flag                             | Default      | Meaning                                 |
+| -------------------------------- | ------------ | --------------------------------------- |
+| `--vad-max-single-segment-time`  | `60000` (ms) | Max continuous speech before forced cut |
+| `--vad-max-end-silence-time`     | `800` (ms)   | Silence that ends a segment             |
+| `--merge-vad` / `--no-merge-vad` | on           | Merge short VAD clips before ASR        |
+| `--merge-length-s`               | `15`         | Max length of merged clips (seconds)    |
+| `--batch-size-s`                 | `60`         | ASR batch budget in seconds of speech   |
+
 
 ```bash
 # defaults already target long media
@@ -259,3 +269,4 @@ Do **not** set `--vad-max-single-segment-time` to the full hour — that defeats
 - Models cache under `~/.cache/modelscope` by default.
 - FunASR `AutoModel` is not concurrency-safe; overlapping requests queue on one process-wide lock.
 - Official CLI (no long-audio patch, no video wrapper): `funasr-server --model sensevoice --device mps --port 8000`
+
