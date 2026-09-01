@@ -8,5 +8,10 @@ __pycache__/
 *.wav
 *.mp3
 *.flac
+*.mp4
+*.mkv
+*.webm
+*.mov
+result*.json
 *.log
 .ipynb_checkpoints/
