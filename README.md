@@ -279,6 +279,21 @@ Do **not** set `--vad-max-single-segment-time` to the full hour — that defeats
 - Language ID, emotion tags, audio events
 - Good CPU / Apple Silicon performance for local deployment
 
+## Speaker labels (`spk=true`)
+
+Pass `-F spk=true` to run CAM++ diarization after ASR. On long files (thousands of segments) FunASR clusters embeddings with UMAP+HDBSCAN.
+
+If clustering fails, the server still returns the transcript (without `speaker` fields) instead of HTTP 500. Restart the server after a Homebrew Python upgrade — a process started on an old `python@3.13` keg cannot import `multiprocessing.dummy` once that keg is gone.
+
+```bash
+curl -X POST http://127.0.0.1:8002/v1/audio/transcriptions \
+  -F file=@clip.mp4 \
+  -F model=sensevoice \
+  -F response_format=verbose_json \
+  -F spk=true \
+  -o result.json
+```
+
 ## Notes
 
 - On Apple Silicon, `mps` is selected automatically when available. If you hit a model-specific MPS issue, fall back with `--device cpu`.
@@ -287,4 +302,5 @@ Do **not** set `--vad-max-single-segment-time` to the full hour — that defeats
 - Models cache under `~/.cache/modelscope` by default.
 - FunASR `AutoModel` is not concurrency-safe; overlapping requests queue on one process-wide lock.
 - Official CLI (no long-audio patch, no video wrapper): `funasr-server --model sensevoice --device mps --port 8000`
+- After `brew upgrade python@3.13`, stop the old server process and start a new one. Do not keep a process that still shows a deleted Cellar path in `ps`.
 

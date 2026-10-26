@@ -485,6 +485,122 @@ def install_transcription_jobs(
     return queue
 
 
+def _ensure_python_runtime_ok() -> None:
+    """Refuse to start if this process cannot import stdlib multiprocessing.dummy.
+
+    Homebrew replacing python@3.13 while a long-lived server is still running
+    leaves the process bound to a deleted prefix. ASR can keep going from
+    already-loaded modules; speaker clustering then dies on a lazy import of
+    ``multiprocessing.dummy`` (joblib ThreadPool → UMAP/HDBSCAN).
+    """
+    prefix = sys.base_prefix or sys.prefix
+    if not os.path.isdir(prefix):
+        print(f"ERROR: Python prefix is missing on disk: {prefix}")
+        print("Homebrew likely upgraded Python while an old server process was running.")
+        print("Stop that process and start again with .venv (see start_server.sh).")
+        sys.exit(1)
+    try:
+        import multiprocessing.dummy  # noqa: F401
+    except ModuleNotFoundError:
+        print("ERROR: stdlib module multiprocessing.dummy is missing.")
+        print(f"  interpreter: {sys.executable}")
+        print(f"  version:     {sys.version.split()[0]}")
+        print(f"  prefix:      {prefix}")
+        print("This usually means the Homebrew Python that created this process was uninstalled.")
+        print("Restart the server. If it still fails, recreate the venv:")
+        print("  rm -rf .venv && python3 -m venv .venv && source .venv/bin/activate")
+        print("  pip install -r requirements.txt")
+        sys.exit(1)
+
+
+def _spectral_labels_for_embeddings(cluster: Any, X: Any, oracle_num: Any) -> Any:
+    """Spectral clustering, subsampled when N is large (O(N²) otherwise)."""
+    import numpy as np
+
+    x_np = X.detach().cpu().numpy() if hasattr(X, "detach") else np.asarray(X)
+    n = int(x_np.shape[0])
+    if n < 20:
+        return np.zeros(n, dtype="int")
+
+    cap = 2047
+    if n <= cap:
+        labels = cluster.spectral_cluster(x_np, oracle_num)
+    else:
+        rng = np.random.default_rng(0)
+        idx = np.sort(rng.choice(n, size=cap, replace=False))
+        sub_labels = cluster.spectral_cluster(x_np[idx], oracle_num)
+        n_spk = int(sub_labels.max()) + 1
+        centers = []
+        for i in range(n_spk):
+            members = x_np[idx][sub_labels == i]
+            if members.size == 0:
+                centers.append(np.zeros(x_np.shape[1], dtype=x_np.dtype))
+            else:
+                centers.append(members.mean(0))
+        centers = np.stack(centers, axis=0)
+        x_n = x_np / np.clip(np.linalg.norm(x_np, axis=1, keepdims=True), 1e-8, None)
+        c_n = centers / np.clip(np.linalg.norm(centers, axis=1, keepdims=True), 1e-8, None)
+        labels = (x_n @ c_n.T).argmax(axis=1)
+
+    if oracle_num is None and "merge_thr" in getattr(cluster, "model_config", {}):
+        labels = cluster.merge_by_cos(labels, x_np, cluster.model_config["merge_thr"])
+    return labels
+
+
+def install_speaker_cluster_safety() -> None:
+    """
+    Speaker diarization (spk=true) runs after ASR. On long media FunASR uses
+    UMAP+HDBSCAN, which pulls in joblib ThreadPool → multiprocessing.dummy.
+
+    - Force UMAP onto one thread so joblib does not need a ThreadPool.
+    - If UMAP still fails, fall back to spectral clustering (subsampled).
+    - If labeling still fails, return the transcript without speaker IDs
+      instead of turning a finished ASR job into HTTP 500.
+    """
+    import funasr.bin._server_app as funasr_server_app
+    import umap.umap_ as umap
+    from funasr.models.campplus.cluster_backend import ClusterBackend
+
+    original_umap_init = umap.UMAP.__init__
+
+    def umap_init_single_thread(self, *args: Any, **kwargs: Any):
+        kwargs["n_jobs"] = 1
+        return original_umap_init(self, *args, **kwargs)
+
+    umap.UMAP.__init__ = umap_init_single_thread  # type: ignore[method-assign]
+    print("  speaker-cluster: UMAP n_jobs=1 (avoid joblib ThreadPool)")
+
+    original_forward = ClusterBackend.forward
+
+    def forward_with_fallback(self, X, **params):
+        try:
+            return original_forward(self, X, **params)
+        except Exception as exc:
+            print(
+                f"  speaker-cluster: UMAP/HDBSCAN failed "
+                f"({type(exc).__name__}: {exc}); spectral fallback"
+            )
+            oracle_num = params.get("oracle_num")
+            return _spectral_labels_for_embeddings(self, X, oracle_num)
+
+    ClusterBackend.forward = forward_with_fallback  # type: ignore[method-assign]
+
+    original_attach = funasr_server_app.attach_speaker_labels
+
+    def attach_speaker_labels_safe(audio_data, sr, segments, speaker_model, device):
+        try:
+            return original_attach(audio_data, sr, segments, speaker_model, device)
+        except Exception as exc:
+            print(
+                f"  speaker-labels: failed ({type(exc).__name__}: {exc}); "
+                "returning transcript without speaker IDs"
+            )
+            return segments
+
+    funasr_server_app.attach_speaker_labels = attach_speaker_labels_safe
+    print("  speaker-cluster: ASR result kept if diarization fails")
+
+
 def build_parser() -> argparse.ArgumentParser:
     default_device = detect_device()
     parser = argparse.ArgumentParser(
@@ -708,6 +824,7 @@ def apply_long_audio_settings(
 
 def main() -> None:
     args = build_parser().parse_args()
+    _ensure_python_runtime_ok()
 
     try:
         import uvicorn
@@ -719,6 +836,9 @@ def main() -> None:
         print("  source .venv/bin/activate")
         print("  pip install -r requirements.txt")
         sys.exit(1)
+
+    print("Installing speaker-cluster safety (UMAP n_jobs=1, keep ASR on failure)...")
+    install_speaker_cluster_safety()
 
     app = create_app(
         device=args.device,
