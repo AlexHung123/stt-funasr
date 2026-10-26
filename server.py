@@ -32,24 +32,29 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from jobs import QUEUE_FULL_MESSAGE, QueueFull, TranscriptionQueue
 
 # Must be module-level: with `from __future__ import annotations`, route param
 # annotations become ForwardRefs resolved against module globals — not the
 # local namespace of install_video_input_support(). Local-only imports leave
 # UploadFile undefined and crash Pydantic with "not fully defined".
-from fastapi import File, Form, HTTPException, UploadFile
+from fastapi import File, Form, HTTPException, Request, UploadFile
 
 # FunASR AutoModel (SenseVoice) is not concurrency-safe: shared kwargs / VAD state
 # and temp-file lifecycles race under concurrent requests. Serialize prepare + ASR.
 _asr_lock = asyncio.Lock()
+_original_transcribe: Optional[Callable] = None
 
 
 def detect_device() -> str:
@@ -220,6 +225,29 @@ async def prepare_media_for_asr(file: Any) -> PreparedMedia:
         raise
 
 
+def prepare_media_from_path(source_path: str, filename: str) -> PreparedMedia:
+    """Open a file already stored on disk. Video is extracted to wav beside it."""
+    suffix = _file_suffix(filename) or _file_suffix(source_path)
+    if suffix not in VIDEO_EXTENSIONS:
+        handle = open(source_path, "rb")
+        upload = _AsyncFileUpload(
+            filename=Path(filename).name or "audio.bin",
+            fileobj=handle,
+        )
+        return PreparedMedia(upload=upload, _open_handles=[handle])
+
+    wav_path = str(Path(source_path).with_suffix(".asr.wav"))
+    print(f"  video-input: ffmpeg extract {suffix} → 16k mono wav ({filename})")
+    ffmpeg_extract_wav(source_path, wav_path)
+    handle = open(wav_path, "rb")
+    upload = _AsyncFileUpload(filename="meeting.wav", fileobj=handle)
+    return PreparedMedia(
+        upload=upload,
+        cleanup_paths=[wav_path],
+        _open_handles=[handle],
+    )
+
+
 def _remove_post_routes(app: Any, paths: set[str]) -> dict[str, Callable]:
     """Drop POST routes for the given paths; return path → original endpoint."""
     found: dict[str, Callable] = {}
@@ -255,6 +283,8 @@ def install_video_input_support(app: Any) -> None:
 
     original_transcribe = originals.get("/v1/audio/transcriptions")
     original_asr = originals.get("/asr")
+    global _original_transcribe
+    _original_transcribe = original_transcribe
 
     if original_transcribe is not None:
 
@@ -324,6 +354,137 @@ def install_video_input_support(app: Any) -> None:
         print("  video-input: wrapped POST /asr (serialized)")
 
 
+def _payload_from_response(response: Any) -> dict[str, Any]:
+    if isinstance(response, dict):
+        return response
+    body = getattr(response, "body", None)
+    if isinstance(body, memoryview):
+        body = body.tobytes()
+    if isinstance(body, bytearray):
+        body = bytes(body)
+    if isinstance(body, bytes):
+        parsed = json.loads(body.decode("utf-8"))
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, str):
+            return {"text": parsed}
+    raise RuntimeError("transcription handler returned an unreadable response")
+
+
+def install_transcription_jobs(
+    app: Any,
+    *,
+    jobs_dir: Path,
+    max_waiting: int,
+    max_bytes: int,
+) -> TranscriptionQueue:
+    """Accept a streamed upload, keep it on disk, and transcribe it one job at a time.
+
+    Speaker diarization stays on unless the caller sends ``X-Spk: false``.
+    """
+    queue = TranscriptionQueue(jobs_dir, max_waiting=max_waiting)
+    queue.load_restarted()
+
+    async def run_job(job: Any) -> dict[str, Any]:
+        if _original_transcribe is None:
+            raise RuntimeError("transcription route is not installed")
+        async with _asr_lock:
+            prepared = await asyncio.to_thread(
+                prepare_media_from_path,
+                job.source_path,
+                job.filename,
+            )
+            try:
+                try:
+                    response = await _original_transcribe(
+                        file=prepared.upload,
+                        model="sensevoice",
+                        language=job.language,
+                        response_format="verbose_json",
+                        spk=job.spk,
+                    )
+                except HTTPException as exc:
+                    detail = exc.detail if isinstance(exc.detail, str) else "Transcription failed"
+                    raise RuntimeError(detail) from exc
+                return _payload_from_response(response)
+            finally:
+                prepared.cleanup()
+
+    previous_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def _jobs_lifespan(app_):
+        task = asyncio.create_task(queue.serve(run_job))
+        app_.state.transcription_worker = task
+        try:
+            async with previous_lifespan(app_):
+                yield
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    app.router.lifespan_context = _jobs_lifespan
+
+    @app.post("/v1/audio/jobs")
+    async def create_transcription_job(request: Request):
+        filename = (request.headers.get("x-filename") or "audio.bin").strip() or "audio.bin"
+        language = (request.headers.get("x-language") or "").strip() or None
+        spk_header = (request.headers.get("x-spk") or "true").strip().lower()
+        spk = spk_header not in ("0", "false", "no")
+        try:
+            job = queue.begin_upload(filename, language, spk)
+        except QueueFull as exc:
+            raise HTTPException(status_code=429, detail=QUEUE_FULL_MESSAGE) from exc
+
+        try:
+            size = 0
+            with open(job.source_path, "wb") as out:
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"File must be {max_bytes} bytes or smaller",
+                        )
+                    out.write(chunk)
+            if size <= 0:
+                raise HTTPException(status_code=400, detail="This file is empty.")
+            queue.mark_queued(job.id)
+            await queue.notify()
+        except HTTPException:
+            queue.abandon(job.id)
+            raise
+        except Exception as exc:
+            queue.abandon(job.id)
+            raise HTTPException(status_code=400, detail="Upload did not finish.") from exc
+        return {"id": job.id, "status": "queued"}
+
+    @app.get("/v1/audio/jobs/{job_id}")
+    async def read_transcription_job(job_id: str):
+        body = queue.public_view(job_id)
+        if body is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return body
+
+    @app.delete("/v1/audio/jobs/{job_id}")
+    async def cancel_transcription_job(job_id: str):
+        status = queue.cancel(job_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {"id": job_id, "status": status}
+
+    print(
+        f"  jobs: dir={jobs_dir} waiting={max_waiting} "
+        f"max_bytes={max_bytes} spk default=on"
+    )
+    return queue
+
+
 def build_parser() -> argparse.ArgumentParser:
     default_device = detect_device()
     parser = argparse.ArgumentParser(
@@ -379,6 +540,23 @@ Test with curl:
         "--spk-model",
         default="cam++",
         help="Speaker model for spk=true requests (default: cam++)",
+    )
+    parser.add_argument(
+        "--jobs-dir",
+        default=str(Path.home() / "stt-jobs"),
+        help="Directory for queued audio on disk (default: ~/stt-jobs). Point this at the large volume.",
+    )
+    parser.add_argument(
+        "--max-waiting-jobs",
+        type=int,
+        default=3,
+        help="How many uploads may wait while one job is transcribing (default: 3)",
+    )
+    parser.add_argument(
+        "--max-upload-bytes",
+        type=int,
+        default=2 * 1024 * 1024 * 1024,
+        help="Largest accepted upload in bytes (default: 2 GiB)",
     )
     parser.add_argument(
         "--cors-origin",
@@ -563,6 +741,13 @@ def main() -> None:
 
     print("Installing video input support (ffmpeg → 16k mono wav)...")
     install_video_input_support(app)
+    print("Installing transcription job queue...")
+    install_transcription_jobs(
+        app,
+        jobs_dir=Path(args.jobs_dir).expanduser(),
+        max_waiting=max(1, args.max_waiting_jobs),
+        max_bytes=args.max_upload_bytes,
+    )
     ffmpeg_ok = shutil.which("ffmpeg") is not None
     if not ffmpeg_ok:
         print("  video-input: WARNING — ffmpeg not on PATH; video uploads will fail")
@@ -587,7 +772,8 @@ def main() -> None:
     print("Long audio: VAD splits speech into chunks; full file length is OK (~1h+).")
     print("Video: mp4/mkv/webm/mov → ffmpeg 16k mono wav in-process, then SenseVoice.")
     print("Audio: wav/mp3/... uses FunASR stock path (no re-encode).")
-    print("Concurrency: ASR jobs are serialized (one at a time) via asyncio.Lock.")
+    print("Concurrency: one transcription runs at a time. Extra uploads wait on disk.")
+    print("Jobs: POST /v1/audio/jobs then poll GET /v1/audio/jobs/{id}. Speaker labels stay on.")
     print("First request may download SenseVoice weights from ModelScope.")
 
     uvicorn.run(app, host=args.host, port=args.port, timeout_keep_alive=600)

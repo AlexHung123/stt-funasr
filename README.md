@@ -181,8 +181,25 @@ Endpoints:
 | `GET`  | `/health`                  | Liveness                         |
 | `GET`  | `/v1/models`               | OpenAI-compatible model list     |
 | `POST` | `/v1/audio/transcriptions` | OpenAI-compatible; audio + video |
+| `POST` | `/v1/audio/jobs`           | Stream an upload to disk and queue it. Returns `{id,status}` immediately. Speaker labels stay on. |
+| `GET`  | `/v1/audio/jobs/{id}`      | `queued`, `running`, `succeeded`, `failed`, or `cancelled` |
+| `DELETE` | `/v1/audio/jobs/{id}`    | Cancel a job that is still queued |
 | `POST` | `/asr`                     | FunASR REST; audio + video       |
 | `GET`  | `/docs`                    | Swagger UI                       |
+
+One job transcribes at a time. Three more may wait. A full queue returns HTTP 429. Put the files on the large disk:
+
+```bash
+python server.py --jobs-dir /path/on/the-4tb-volume/stt-jobs
+```
+
+```bash
+curl -X POST http://127.0.0.1:8002/v1/audio/jobs \
+  -H "x-filename: clip.mp4" \
+  -H "x-language: yue" \
+  -H "x-spk: true" \
+  --data-binary @clip.mp4
+```
 
 
 ### cURL (audio)
