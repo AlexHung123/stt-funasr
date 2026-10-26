@@ -187,10 +187,11 @@ Endpoints:
 | `POST` | `/asr`                     | FunASR REST; audio + video       |
 | `GET`  | `/docs`                    | Swagger UI                       |
 
-One job transcribes at a time. Three more may wait. A full queue returns HTTP 429. Put the files on the large disk:
+One job transcribes at a time. Three more may wait. A full queue returns HTTP 429. Job files are stored in `./stt-jobs`:
 
 ```bash
-python server.py --jobs-dir /path/on/the-4tb-volume/stt-jobs
+./start_server.sh
+# jobs are stored in ./stt-jobs
 ```
 
 ```bash

@@ -15,3 +15,5 @@ __pycache__/
 result*.json
 *.log
 .ipynb_checkpoints/
+stt-jobs/*
+!stt-jobs/.gitkeep

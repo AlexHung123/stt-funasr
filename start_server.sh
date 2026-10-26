@@ -21,4 +21,7 @@ export PYTHONUNBUFFERED=1
 # export MODELSCOPE_CACHE="$ROOT/.cache/modelscope"
 # export HF_HOME="$ROOT/.cache/huggingface"
 
-exec python server.py --model sensevoice --device mps "$@"
+JOBS_DIR="$ROOT/stt-jobs"
+mkdir -p "$JOBS_DIR"
+
+exec python server.py --model sensevoice --device mps --jobs-dir "$JOBS_DIR" "$@"

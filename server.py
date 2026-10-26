@@ -543,8 +543,8 @@ Test with curl:
     )
     parser.add_argument(
         "--jobs-dir",
-        default=str(Path.home() / "stt-jobs"),
-        help="Directory for queued audio on disk (default: ~/stt-jobs). Point this at the large volume.",
+        default=str(Path(__file__).resolve().parent / "stt-jobs"),
+        help="Directory for queued audio on disk (default: ./stt-jobs next to server.py)",
     )
     parser.add_argument(
         "--max-waiting-jobs",
